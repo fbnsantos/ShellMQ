@@ -127,15 +127,33 @@ info "Installing paho-mqtt..."
 chown -R "$RUN_AS:$RUN_AS" "$VENV_DIR"
 success "paho-mqtt installed"
 
-# ── build ExecStart command ───────────────────────────────────────────────────
+# ── write environment file (handles special chars in password) ────────────────
+ENV_FILE="${INSTALL_DIR}/mole.env"
+cat > "$ENV_FILE" << ENVEOF
+MOLE_BROKER=${BROKER}
+MOLE_PORT=${PORT}
+MOLE_DEVICE_ID=${DEVICE_ID}
+MOLE_USERNAME=${USERNAME}
+MOLE_PASSWORD=${PASSWORD}
+MOLE_SHELL=${SHELL_BIN}
+MOLE_TLS=${TLS}
+ENVEOF
+chmod 600 "$ENV_FILE"
+chown "$RUN_AS:$RUN_AS" "$ENV_FILE"
+success "Environment file written to ${ENV_FILE}"
+
+# ── build ExecStart — credentials come from EnvironmentFile ──────────────────
+# systemd expands ${VAR} from EnvironmentFile before launching the process
+TLS_ARG=""
+[[ -n "$TLS" ]] && TLS_ARG="--tls"
 EXEC_CMD="${VENV_PYTHON} ${INSTALL_DIR}/server.py"
-EXEC_CMD+=" --broker ${BROKER}"
-EXEC_CMD+=" --port ${PORT}"
-EXEC_CMD+=" --device-id ${DEVICE_ID}"
-EXEC_CMD+=" --shell ${SHELL_BIN}"
-[[ -n "$USERNAME" ]] && EXEC_CMD+=" --username ${USERNAME}"
-[[ -n "$PASSWORD" ]] && EXEC_CMD+=" --password '${PASSWORD}'"
-[[ -n "$TLS"      ]] && EXEC_CMD+=" ${TLS}"
+EXEC_CMD+=" --broker \${MOLE_BROKER}"
+EXEC_CMD+=" --port \${MOLE_PORT}"
+EXEC_CMD+=" --device-id \${MOLE_DEVICE_ID}"
+EXEC_CMD+=" --shell \${MOLE_SHELL}"
+EXEC_CMD+=" --username \${MOLE_USERNAME}"
+EXEC_CMD+=" --password \${MOLE_PASSWORD}"
+[[ -n "$TLS" ]] && EXEC_CMD+=" --tls"
 
 # ── write config file ─────────────────────────────────────────────────────────
 CONFIG_FILE="${INSTALL_DIR}/mole.conf"
@@ -166,6 +184,7 @@ Wants=network-online.target
 Type=simple
 User=${RUN_AS}
 WorkingDirectory=${INSTALL_DIR}
+EnvironmentFile=${INSTALL_DIR}/mole.env
 ExecStart=${EXEC_CMD}
 Restart=always
 RestartSec=10

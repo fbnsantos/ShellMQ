@@ -88,8 +88,8 @@ class MoleServer:
         self.client.on_message = self._on_message
         self.client.on_disconnect = self._on_disconnect
 
-        if username:
-            self.client.username_pw_set(username, password)
+        if username and username.strip():
+            self.client.username_pw_set(username, password or None)
         if tls:
             self.client.tls_set()
 
