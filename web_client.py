@@ -24,10 +24,12 @@ HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>mqtt-shell</title>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/xterm/5.3.0/xterm.min.css">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xterm/5.3.0/xterm.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xterm/5.3.0/addon-fit/addon-fit.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.0.5/mqtt.min.js"></script>
+<!-- xterm.js 5.3.0 -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+<!-- mqtt.js -->
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.3.4/dist/mqtt.min.js"></script>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -315,7 +317,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="spacer"></div>
     <div class="status-pill" id="broker-status">
       <div class="dot blink"></div>
-      <span id="broker-status-text">desligado</span>
+      <span id="broker-status-text">disconnected</span>
     </div>
   </header>
 
@@ -339,8 +341,8 @@ HTML = r"""<!DOCTYPE html>
           <div class="field-label">Password (opcional)</div>
           <input type="password" id="broker-pass" placeholder="">
         </div>
-        <button class="btn btn-primary" id="btn-connect">Ligar</button>
-        <button class="btn btn-danger" id="btn-disconnect" style="display:none">Desligar</button>
+        <button class="btn btn-primary" id="btn-connect">Connect</button>
+        <button class="btn btn-danger" id="btn-disconnect" style="display:none">Disconnect</button>
       </div>
 
       <div class="sidebar-section">Dispositivos</div>
@@ -358,11 +360,15 @@ HTML = r"""<!DOCTYPE html>
                 style="width:auto;padding:3px 12px;display:none">
           New Session
         </button>
+        <button class="btn btn-primary" id="btn-test-input"
+                style="width:auto;padding:3px 12px;display:none;margin-left:6px;background:var(--accent2)">
+          Test
+        </button>
       </div>
       <div id="terminal-container">
         <div class="splash" id="splash">
           <div class="splash-logo">mqtt<span>://</span>shell</div>
-          <div>Liga ao broker e selecciona um dispositivo</div>
+          <div>Connect to a broker and select a device</div>
         </div>
       </div>
       <div class="log-panel" id="log-panel"></div>
@@ -433,17 +439,30 @@ function initTerminal() {
     allowTransparency: true,
   });
 
-  fitAddon = new FitAddon.FitAddon();
+  // xterm-addon-fit via jsdelivr exports constructor as window.FitAddon
+  fitAddon = (typeof FitAddon === "function") ? new FitAddon() : new FitAddon.FitAddon();
   term.loadAddon(fitAddon);
   term.open(container);
   fitAddon.fit();
+  term.focus();
 
   term.onData(data => {
     if (!sessionActive || !mqttClient) return;
     const topic = `shell/${selectedDevice}/session/${sessionId}/in`;
-    const bytes = new TextEncoder().encode(data);
-    mqttClient.publish(topic, bytes, { qos: 0 });
+    mqttClient.publish(topic, data, { qos: 0 });
   });
+
+  // Fallback: if xterm loses focus, document keydown re-focuses and replays the key
+  document.addEventListener('keydown', (e) => {
+    if (!sessionActive) return;
+    // If the active element is not inside the terminal, re-focus and send the key
+    const termEl = container.querySelector('.xterm');
+    if (termEl && !termEl.contains(document.activeElement)) {
+      term.focus();
+    }
+  });
+
+  container.addEventListener('click', () => term.focus());
 
   window.addEventListener('resize', () => {
     if (fitAddon) {
@@ -468,7 +487,7 @@ function renderDevices() {
   const ids = Object.keys(devices).filter(id => devices[id].online);
 
   if (ids.length === 0) {
-    container.innerHTML = '<div class="no-devices">Nenhum dispositivo online</div>';
+    container.innerHTML = '<div class="no-devices">No online devices</div>';
     return;
   }
 
@@ -492,6 +511,7 @@ function selectDevice(id) {
   selectedDevice = id;
   renderDevices();
   document.getElementById('btn-open-session').style.display = 'inline-block';
+  document.getElementById('btn-test-input').style.display = 'inline-block';
   logLine(`Device selected: ${id}`, 'ok');
 }
 
@@ -508,19 +528,22 @@ function openSession() {
   sessionId = Math.random().toString(36).substr(2, 8);
   document.getElementById('session-label').textContent = sessionId;
 
-  // subscribe to this session output
-  const topicOut = `shell/${selectedDevice}/session/${sessionId}/out`;
-  mqttClient.subscribe(topicOut, { qos: 0 });
+  // subscribe to session output and session-specific retained announce
+  mqttClient.subscribe(`shell/${selectedDevice}/session/${sessionId}/out`, { qos: 0 });
+  mqttClient.subscribe(`shell/${selectedDevice}/control/announce/${sessionId}`, { qos: 1 });
 
-  // request new session
-  mqttClient.publish(
-    `shell/${selectedDevice}/control/new`,
-    JSON.stringify({ session_id: sessionId }),
-    { qos: 1 }
-  );
+  // small delay so subscriptions are confirmed before requesting the session
+  setTimeout(() => {
+    mqttClient.publish(
+      `shell/${selectedDevice}/control/new`,
+      JSON.stringify({ session_id: sessionId }),
+      { qos: 1 }
+    );
+    logLine(`Session request sent for ${sessionId}`);
+  }, 300);
 
   initTerminal();
-  term.write(`\x1b[90mA ligar ao dispositivo ${selectedDevice}...\x1b[0m\r\n`);
+  term.write(`\x1b[90mConnecting to ${selectedDevice}...\x1b[0m\r\n`);
   logLine(`Requesting session ${sessionId} on ${selectedDevice}...`);
 }
 
@@ -563,7 +586,12 @@ function connectBroker() {
         const data = JSON.parse(payload.toString());
         const id = data.device_id;
         if (id) {
-          devices[id] = data;
+          if (data.online) {
+            devices[id] = data;
+            logLine(`Device online: ${id}`, 'ok');
+          } else {
+            delete devices[id];
+          }
           renderDevices();
         }
       } catch (e) {}
@@ -576,6 +604,9 @@ function connectBroker() {
         const data = JSON.parse(payload.toString());
         if (data.session_id === sessionId) {
           sessionActive = true;
+          // force focus with small delay to let the DOM settle
+          setTimeout(() => { term.focus(); }, 100);
+          setTimeout(() => { term.focus(); }, 500);
           const sep = '─'.repeat(50);
           term.write(`\r\n\x1b[1;32m${sep}\x1b[0m\r\n`);
           term.write(`\x1b[1;32m  mole connected\x1b[0m  \x1b[90mdevice:\x1b[0m ${selectedDevice}\r\n`);
@@ -583,7 +614,9 @@ function connectBroker() {
           logLine(`Session ${sessionId} active`, 'ok');
           sendResize();
           // send distinctive PS1
-          const ps1 = `export PS1="\\033[1;33m[mole:${selectedDevice}]\\033[0m \\w \\$ "\n`;
+          const ps1 = 'export PS1="' +
+                    '\\[\\033[1;33m\\][mole:' + selectedDevice + '\\[\\033[0m\\] \\w \\$ "' +
+                    '\n';
           setTimeout(() => mqttClient.publish(
             `shell/${selectedDevice}/session/${sessionId}/in`,
             ps1, { qos: 0 }
@@ -605,9 +638,15 @@ function connectBroker() {
     logLine(`MQTT error: ${err.message}`, 'err');
   });
 
+  let _lastDisconnectLog = 0;
   mqttClient.on('close', () => {
     setBrokerStatus('', 'disconnected');
-    logLine('Desligado do broker', 'warn');
+    // throttle disconnect log to avoid spam on repeated reconnect attempts
+    const now = Date.now();
+    if (now - _lastDisconnectLog > 5000) {
+      logLine('Disconnected from broker', 'warn');
+      _lastDisconnectLog = now;
+    }
     sessionActive = false;
     document.getElementById('btn-connect').style.display = 'block';
     document.getElementById('btn-disconnect').style.display = 'none';
@@ -623,6 +662,20 @@ function disconnectBroker() {
 
 // ── eventos ──────────────────────────────────────────────────────────────────
 document.getElementById('btn-connect').onclick = connectBroker;
+
+document.getElementById('btn-test-input').onclick = () => {
+  if (!sessionActive || !mqttClient) {
+    logLine('Session not active', 'err');
+    return;
+  }
+  logLine('Sending test: echo hello', 'ok');
+  mqttClient.publish(
+    `shell/${selectedDevice}/session/${sessionId}/in`,
+    'echo hello_from_web\n',
+    { qos: 0 }
+  );
+};
+
 document.getElementById('btn-disconnect').onclick = disconnectBroker;
 document.getElementById('btn-open-session').onclick = openSession;
 </script>
