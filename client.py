@@ -61,6 +61,7 @@ class MoleClient:
         self.session_id = session_id or uuid.uuid4().hex[:8]
         self.connected_to_broker = threading.Event()
         self.session_ready = threading.Event()
+        self._subscriptions_confirmed = threading.Event()
         self._running = True
 
         if _MQTT_V2:
@@ -73,6 +74,7 @@ class MoleClient:
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
         self.client.on_disconnect = self._on_disconnect
+        self.client.on_subscribe = self._on_subscribe
 
         if username:
             self.client.username_pw_set(username, password)
@@ -96,15 +98,21 @@ class MoleClient:
             self._running = False
             return
         log.debug("Connected to broker")
+        self._pending_subs = 2
         self.connected_to_broker.set()
         client.subscribe(self._topic_out(), qos=0)
-        client.subscribe(f"shell/{self.device_id}/control/announce", qos=1)
+        client.subscribe(f"shell/{self.device_id}/control/announce/{self.session_id}", qos=1)
 
     def _on_disconnect(self, client, userdata, rc, properties=None):
         if self._running:
             sys.stdout.buffer.write(b"\r\n[mole: disconnected from broker]\r\n")
             sys.stdout.buffer.flush()
             self._running = False
+
+    def _on_subscribe(self, client, userdata, mid, granted_qos, properties=None):
+        self._pending_subs -= 1
+        if self._pending_subs <= 0:
+            self._subscriptions_confirmed.set()
 
     def _on_message(self, client, userdata, msg):
         topic = msg.topic
@@ -116,7 +124,7 @@ class MoleClient:
             return
 
         # session creation confirmed by server
-        if topic == f"shell/{self.device_id}/control/announce":
+        if topic == f"shell/{self.device_id}/control/announce/{self.session_id}":
             try:
                 data = json.loads(msg.payload.decode())
                 if data.get("session_id") == self.session_id:
@@ -187,8 +195,9 @@ class MoleClient:
         )
         sys.stdout.flush()
 
-        # small delay to let subscriptions settle before requesting the session
-        time.sleep(0.5)
+        # wait for broker to confirm our subscriptions before requesting the session
+        if not self._subscriptions_confirmed.wait(timeout=5):
+            log.debug("Subscription confirmation timed out, proceeding anyway")
 
         # request a new session from the server
         self.client.publish(
@@ -252,6 +261,11 @@ class DeviceLister:
 
     def _on_connect(self, client, userdata, flags, rc, properties=None):
         client.subscribe("shell/+/presence", qos=1)
+
+    def _on_subscribe(self, client, userdata, mid, granted_qos, properties=None):
+        self._pending_subs -= 1
+        if self._pending_subs <= 0:
+            self._subscriptions_confirmed.set()
 
     def _on_message(self, client, userdata, msg):
         try:

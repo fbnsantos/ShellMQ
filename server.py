@@ -179,7 +179,7 @@ class MoleServer:
 
             # announce session to the client
             self.client.publish(
-                f"shell/{self.device_id}/control/announce",
+                f"shell/{self.device_id}/control/announce/{session_id}",
                 json.dumps({
                     "session_id": session_id,
                     "device_id": self.device_id,
@@ -187,6 +187,7 @@ class MoleServer:
                     "created_at": session.created_at,
                 }),
                 qos=1,
+                retain=True,
             )
 
             self._publish_presence()
