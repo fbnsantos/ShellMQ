@@ -27,6 +27,11 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 import paho.mqtt.client as mqtt
+try:
+    from paho.mqtt.enums import CallbackAPIVersion
+    _MQTT_V2 = True
+except ImportError:
+    _MQTT_V2 = False
 
 # ── logging ───────────────────────────────────────────────────────────────────
 
@@ -72,7 +77,13 @@ class MoleServer:
         self.sessions: Dict[str, Session] = {}
         self._lock = threading.Lock()
 
-        self.client = mqtt.Client(client_id=f"mole-server-{device_id}")
+        if _MQTT_V2:
+            self.client = mqtt.Client(
+                callback_api_version=CallbackAPIVersion.VERSION2,
+                client_id=f"mole-server-{device_id}",
+            )
+        else:
+            self.client = mqtt.Client(client_id=f"mole-server-{device_id}")
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
         self.client.on_disconnect = self._on_disconnect

@@ -22,6 +22,11 @@ import uuid
 from typing import Optional
 
 import paho.mqtt.client as mqtt
+try:
+    from paho.mqtt.enums import CallbackAPIVersion
+    _MQTT_V2 = True
+except ImportError:
+    _MQTT_V2 = False
 
 log = logging.getLogger("mole-client")
 
@@ -58,7 +63,13 @@ class MoleClient:
         self.session_ready = threading.Event()
         self._running = True
 
-        self.client = mqtt.Client(client_id=f"mole-client-{self.session_id}")
+        if _MQTT_V2:
+            self.client = mqtt.Client(
+                callback_api_version=CallbackAPIVersion.VERSION2,
+                client_id=f"mole-client-{self.session_id}",
+            )
+        else:
+            self.client = mqtt.Client(client_id=f"mole-client-{self.session_id}")
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
         self.client.on_disconnect = self._on_disconnect
@@ -176,6 +187,9 @@ class MoleClient:
         )
         sys.stdout.flush()
 
+        # small delay to let subscriptions settle before requesting the session
+        time.sleep(0.5)
+
         # request a new session from the server
         self.client.publish(
             f"shell/{self.device_id}/control/new",
@@ -220,7 +234,13 @@ class DeviceLister:
     def __init__(self, broker: str, port: int,
                  username: Optional[str], password: Optional[str], tls: bool):
         self.devices = {}
-        self.client = mqtt.Client(client_id=f"mole-list-{uuid.uuid4().hex[:4]}")
+        if _MQTT_V2:
+            self.client = mqtt.Client(
+                callback_api_version=CallbackAPIVersion.VERSION2,
+                client_id=f"mole-list-{uuid.uuid4().hex[:4]}",
+            )
+        else:
+            self.client = mqtt.Client(client_id=f"mole-list-{uuid.uuid4().hex[:4]}")
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
         if username:
