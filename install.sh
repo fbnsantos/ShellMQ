@@ -78,7 +78,6 @@ fi
 
 # ── checks ────────────────────────────────────────────────────────────────────
 command -v python3 >/dev/null || error "python3 not found"
-command -v pip3    >/dev/null || error "pip3 not found"
 id "$RUN_AS" >/dev/null 2>&1 || error "User '$RUN_AS' not found"
 
 PYTHON="$(command -v python3)"
@@ -99,14 +98,19 @@ success "Copied server.py to ${INSTALL_DIR}"
 VENV_DIR="${INSTALL_DIR}/.venv"
 if [[ ! -d "$VENV_DIR" ]]; then
     info "Creating virtual environment..."
-    sudo -u "$RUN_AS" python3 -m venv "$VENV_DIR"
+    python3 -m venv "$VENV_DIR"
+    chown -R "$RUN_AS:$RUN_AS" "$VENV_DIR"
 fi
 
-info "Installing paho-mqtt..."
-sudo -u "$RUN_AS" "${VENV_DIR}/bin/pip" install --quiet --upgrade paho-mqtt
-success "paho-mqtt installed"
-
 VENV_PYTHON="${VENV_DIR}/bin/python3"
+VENV_PIP="${VENV_DIR}/bin/python3 -m pip"
+
+info "Installing paho-mqtt..."
+# use 'python3 -m pip' inside the venv — avoids 'pip not found' on some systems
+"${VENV_DIR}/bin/python3" -m pip install --quiet --upgrade pip
+"${VENV_DIR}/bin/python3" -m pip install --quiet --upgrade paho-mqtt
+chown -R "$RUN_AS:$RUN_AS" "$VENV_DIR"
+success "paho-mqtt installed"
 
 # ── build ExecStart command ───────────────────────────────────────────────────
 EXEC_CMD="${VENV_PYTHON} ${INSTALL_DIR}/server.py"
