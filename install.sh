@@ -98,17 +98,31 @@ success "Copied server.py to ${INSTALL_DIR}"
 VENV_DIR="${INSTALL_DIR}/.venv"
 if [[ ! -d "$VENV_DIR" ]]; then
     info "Creating virtual environment..."
-    python3 -m venv "$VENV_DIR"
+    # try with pip, fall back to --without-pip if ensurepip is unavailable
+    python3 -m venv "$VENV_DIR" 2>/dev/null ||         python3 -m venv --without-pip "$VENV_DIR"
     chown -R "$RUN_AS:$RUN_AS" "$VENV_DIR"
 fi
 
 VENV_PYTHON="${VENV_DIR}/bin/python3"
-VENV_PIP="${VENV_DIR}/bin/python3 -m pip"
+
+# ensure pip is available inside the venv
+if ! "$VENV_PYTHON" -m pip --version &>/dev/null; then
+    info "pip not found in venv — bootstrapping with get-pip.py ..."
+    TMP_PIP="$(mktemp /tmp/get-pip.XXXXXX.py)"
+    if command -v curl &>/dev/null; then
+        curl -fsSL https://bootstrap.pypa.io/get-pip.py -o "$TMP_PIP"
+    elif command -v wget &>/dev/null; then
+        wget -qO "$TMP_PIP" https://bootstrap.pypa.io/get-pip.py
+    else
+        error "Neither curl nor wget found — cannot bootstrap pip"
+    fi
+    "$VENV_PYTHON" "$TMP_PIP" --quiet
+    rm -f "$TMP_PIP"
+    chown -R "$RUN_AS:$RUN_AS" "$VENV_DIR"
+fi
 
 info "Installing paho-mqtt..."
-# use 'python3 -m pip' inside the venv — avoids 'pip not found' on some systems
-"${VENV_DIR}/bin/python3" -m pip install --quiet --upgrade pip
-"${VENV_DIR}/bin/python3" -m pip install --quiet --upgrade paho-mqtt
+"$VENV_PYTHON" -m pip install --quiet --upgrade paho-mqtt
 chown -R "$RUN_AS:$RUN_AS" "$VENV_DIR"
 success "paho-mqtt installed"
 
