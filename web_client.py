@@ -492,7 +492,7 @@ function selectDevice(id) {
   selectedDevice = id;
   renderDevices();
   document.getElementById('btn-open-session').style.display = 'inline-block';
-  logLine(`Dispositivo seleccionado: ${id}`, 'ok');
+  logLine(`Device selected: ${id}`, 'ok');
 }
 
 // ── session ───────────────────────────────────────────────────────────────────
@@ -534,8 +534,8 @@ function connectBroker() {
   const clientId = `mqtt-shell-web-${Math.random().toString(36).substr(2, 6)}`;
   const url = `ws://${host}:${port}/mqtt`;
 
-  logLine(`A ligar a ${url} ...`);
-  setBrokerStatus('', 'a ligar...');
+  logLine(`Connecting to ${url} ...`);
+  setBrokerStatus('', 'connecting...');
 
   const opts = { clientId };
   if (user) { opts.username = user; opts.password = pass; }
@@ -544,12 +544,11 @@ function connectBroker() {
 
   mqttClient.on('connect', () => {
     setBrokerStatus('connected', `${host}:${port}`);
-    logLine(`Ligado ao broker ${host}:${port}`, 'ok');
+    logLine(`Connected to broker ${host}:${port}`, 'ok');
 
     // subscribe to all device presence topics
     mqttClient.subscribe('shell/+/presence', { qos: 1 });
-    // subscribe to session announcements
-    mqttClient.subscribe('shell/+/control/announce', { qos: 1 });
+    // announce topics are session-specific and retained — subscribed per session in openSession()
 
     document.getElementById('btn-connect').style.display = 'none';
     document.getElementById('btn-disconnect').style.display = 'block';
@@ -571,14 +570,24 @@ function connectBroker() {
       return;
     }
 
-    // session creation confirmed
-    if (topic.match(/^shell\/[^/]+\/control\/announce$/)) {
+    // session creation confirmed (session-specific retained topic)
+    if (sessionId && topic === `shell/${selectedDevice}/control/announce/${sessionId}`) {
       try {
         const data = JSON.parse(payload.toString());
         if (data.session_id === sessionId) {
           sessionActive = true;
+          const sep = '─'.repeat(50);
+          term.write(`\r\n\x1b[1;32m${sep}\x1b[0m\r\n`);
+          term.write(`\x1b[1;32m  mole connected\x1b[0m  \x1b[90mdevice:\x1b[0m ${selectedDevice}\r\n`);
+          term.write(`\x1b[1;32m${sep}\x1b[0m\r\n\r\n`);
           logLine(`Session ${sessionId} active`, 'ok');
           sendResize();
+          // send distinctive PS1
+          const ps1 = `export PS1="\\033[1;33m[mole:${selectedDevice}]\\033[0m \\w \\$ "\n`;
+          setTimeout(() => mqttClient.publish(
+            `shell/${selectedDevice}/session/${sessionId}/in`,
+            ps1, { qos: 0 }
+          ), 300);
         }
       } catch (e) {}
       return;
@@ -592,12 +601,12 @@ function connectBroker() {
   });
 
   mqttClient.on('error', err => {
-    setBrokerStatus('error', 'erro');
-    logLine(`Erro MQTT: ${err.message}`, 'err');
+    setBrokerStatus('error', 'error');
+    logLine(`MQTT error: ${err.message}`, 'err');
   });
 
   mqttClient.on('close', () => {
-    setBrokerStatus('', 'desligado');
+    setBrokerStatus('', 'disconnected');
     logLine('Desligado do broker', 'warn');
     sessionActive = false;
     document.getElementById('btn-connect').style.display = 'block';

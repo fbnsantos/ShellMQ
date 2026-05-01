@@ -35,18 +35,33 @@ log = logging.getLogger("mole-client")
 class RawTerminal:
     """Switches the terminal to raw mode and restores it on exit."""
 
-    def __init__(self, fd=sys.stdin.fileno()):
+    def __init__(self, fd=None):
+        if fd is None:
+            fd = sys.stdin.fileno()
         self.fd = fd
         self.old_settings = None
 
+    def enter_raw(self):
+        """Actually apply raw mode — call this after reader thread is blocking."""
+        try:
+            self.old_settings = termios.tcgetattr(self.fd)
+            tty.setraw(self.fd, termios.TCSAFLUSH)
+            log.debug("RawTerminal: raw mode active, fd=%d", self.fd)
+        except termios.error as e:
+            log.debug("RawTerminal: could not set raw mode: %s", e)
+            self.old_settings = None
+
     def __enter__(self):
-        self.old_settings = termios.tcgetattr(self.fd)
-        tty.setraw(self.fd)
+        # Don't apply raw mode yet — caller will call enter_raw() at the right time
         return self
 
     def __exit__(self, *args):
         if self.old_settings:
-            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+            try:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+                log.debug("RawTerminal: terminal restored")
+            except termios.error:
+                pass
 
 
 # ── client ────────────────────────────────────────────────────────────────────
@@ -121,6 +136,8 @@ class MoleClient:
         if topic == self._topic_out():
             sys.stdout.buffer.write(msg.payload)
             sys.stdout.buffer.flush()
+            if b"[mole: session closed]" in msg.payload:
+                self._running = False
             return
 
         # session creation confirmed by server
@@ -155,29 +172,76 @@ class MoleClient:
 
     # ── stdin loop ────────────────────────────────────────────────────────────
 
-    def _stdin_loop(self):
+    def _stdin_loop(self, raw_term):
         """Reads stdin in raw mode and publishes to MQTT."""
+        import queue
         stdin_fd = sys.stdin.fileno()
+
+        # Apply raw mode before any read attempt.
+        raw_term.enter_raw()
+        log.debug("stdin loop started: fd=%d isatty=%s", stdin_fd, os.isatty(stdin_fd))
+
+        q = queue.Queue()
+
+        def _reader():
+            try:
+                while self._running:
+                    ch = os.read(stdin_fd, 256)
+                    if not ch:
+                        log.debug("stdin: os.read returned empty")
+                        break
+                    q.put(ch)
+            except OSError as e:
+                log.debug("stdin reader OSError: %s", e)
+            q.put(None)
+
+        t = threading.Thread(target=_reader, daemon=True, name="stdin-reader")
+        t.start()
+
         while self._running:
             try:
-                r, _, _ = select.select([stdin_fd], [], [], 0.05)
-                if r:
-                    data = os.read(stdin_fd, 256)
-                    if not data:
-                        break
-                    # Ctrl+] to quit (same as telnet)
-                    if b"\x1d" in data:
-                        self._running = False
-                        break
-                    self.client.publish(self._topic_in(), data, qos=0)
-            except (OSError, ValueError):
+                chunk = q.get(timeout=0.1)
+            except Exception:
+                continue
+            if chunk is None:
+                log.debug("stdin: EOF")
                 break
+            # Ctrl+] (0x1d) to quit
+            if b"\x1d" in chunk:
+                self._running = False
+                break
+            self.client.publish(self._topic_in(), chunk, qos=0)
 
+        # ── cleanup ──────────────────────────────────────────────────────────
+        self._running = False
+
+        # 1. Restore terminal IMMEDIATELY — must happen before anything else
+        #    so the local shell is usable again even if the thread is still alive
+        raw_term.__exit__(None, None, None)
+
+        # 2. Unblock the reader thread which is stuck on os.read(stdin_fd).
+        #    On macOS, O_NONBLOCK on stdin is unreliable, so we use a self-pipe:
+        #    open a pipe, replace stdin fd with the read end, write to the write
+        #    end — this causes os.read(stdin_fd) to return immediately.
+        try:
+            pipe_r, pipe_w = os.pipe()
+            os.dup2(pipe_r, stdin_fd)   # reader now reads from pipe (returns "")
+            os.write(pipe_w, b"\x00")   # unblock it
+            os.close(pipe_r)
+            os.close(pipe_w)
+        except OSError:
+            pass
+
+        t.join(timeout=1.0)
+
+        log.debug("stdin loop done")
         self._running = False
 
     # ── run ───────────────────────────────────────────────────────────────────
 
     def run(self):
+        logging.basicConfig(level=logging.DEBUG,
+                            format="%(asctime)s [CLIENT] %(levelname)s %(message)s")
         sys.stdout.write(f"mole: connecting to {self.broker}:{self.port} ...\r\n")
         sys.stdout.flush()
 
@@ -217,19 +281,39 @@ class MoleClient:
             )
             return 1
 
+        cols = 60
+        banner = "─" * cols
         sys.stdout.write(
-            f"mole: session {self.session_id} active. "
-            f"Press Ctrl+] to quit.\r\n\r\n"
+            f"\r\n\033[1;32m{banner}\033[0m\r\n"
+            f"\033[1;32m  mole connected\033[0m  "
+            f"\033[90mdevice:\033[0m {self.device_id}  "
+            f"\033[90msession:\033[0m {self.session_id}\r\n"
+            f"\033[90m  Ctrl+] to disconnect\033[0m\r\n"
+            f"\033[1;32m{banner}\033[0m\r\n\r\n"
         )
         sys.stdout.flush()
 
         self._setup_sigwinch()
         self._send_resize()
 
-        with RawTerminal():
-            self._stdin_loop()
+        with RawTerminal() as raw_term:
+            # Send PS1 to make the remote prompt visually distinct
+            esc = "\033"
+            ps1_prompt = (
+                f'export PS1="'
+                f'\\[{esc}[1;33m\\][mole:{self.device_id}]\\[{esc}[0m\\] \\w \\$ "'
+                "\n"
+            )
+            time.sleep(0.2)  # wait for bash to be ready
+            self.client.publish(self._topic_in(), ps1_prompt.encode(), qos=0)
+            self._stdin_loop(raw_term)
+            # Note: terminal already restored inside _stdin_loop cleanup
 
-        sys.stdout.write("\r\nmole: session closed.\r\n")
+        sys.stdout.write(
+            f"\r\n\033[1;32m{banner}\033[0m\r\n"
+            f"\033[1;32m  mole disconnected\033[0m\r\n"
+            f"\033[1;32m{banner}\033[0m\r\n"
+        )
         self.client.loop_stop()
         self.client.disconnect()
         return 0
