@@ -51,6 +51,7 @@ while [[ $# -gt 0 ]]; do
         --device-id)   DEVICE_ID="$2";  shift 2 ;;
         --username)    USERNAME="$2";   shift 2 ;;
         --password)    PASSWORD="$2";   shift 2 ;;
+        # strip surrounding quotes if passed with quotes
         --shell)       SHELL_BIN="$2";  shift 2 ;;
         --tls)         TLS="--tls";     shift   ;;
         --user)        RUN_AS="$2";     shift 2 ;;
@@ -133,7 +134,7 @@ EXEC_CMD+=" --port ${PORT}"
 EXEC_CMD+=" --device-id ${DEVICE_ID}"
 EXEC_CMD+=" --shell ${SHELL_BIN}"
 [[ -n "$USERNAME" ]] && EXEC_CMD+=" --username ${USERNAME}"
-[[ -n "$PASSWORD" ]] && EXEC_CMD+=" --password ${PASSWORD}"
+[[ -n "$PASSWORD" ]] && EXEC_CMD+=" --password '${PASSWORD}'"
 [[ -n "$TLS"      ]] && EXEC_CMD+=" ${TLS}"
 
 # ── write config file ─────────────────────────────────────────────────────────
@@ -144,7 +145,7 @@ BROKER=${BROKER}
 PORT=${PORT}
 DEVICE_ID=${DEVICE_ID}
 USERNAME=${USERNAME}
-PASSWORD=${PASSWORD}
+PASSWORD='${PASSWORD}'
 SHELL=${SHELL_BIN}
 TLS=${TLS}
 EOF
