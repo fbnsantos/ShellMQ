@@ -1,0 +1,5 @@
+# core (server + CLI client)
+paho-mqtt>=1.6.1
+
+# web client only
+aiohttp>=3.9.0
