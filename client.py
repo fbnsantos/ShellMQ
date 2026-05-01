@@ -90,7 +90,7 @@ class MoleClient:
 
     # ── MQTT callbacks ────────────────────────────────────────────────────────
 
-    def _on_connect(self, client, userdata, flags, rc):
+    def _on_connect(self, client, userdata, flags, rc, properties=None):
         if rc != 0:
             sys.stderr.write(f"\r\nmole: failed to connect to broker (rc={rc})\r\n")
             self._running = False
@@ -100,7 +100,7 @@ class MoleClient:
         client.subscribe(self._topic_out(), qos=0)
         client.subscribe(f"shell/{self.device_id}/control/announce", qos=1)
 
-    def _on_disconnect(self, client, userdata, rc):
+    def _on_disconnect(self, client, userdata, rc, properties=None):
         if self._running:
             sys.stdout.buffer.write(b"\r\n[mole: disconnected from broker]\r\n")
             sys.stdout.buffer.flush()
@@ -250,7 +250,7 @@ class DeviceLister:
         self.broker = broker
         self.port = port
 
-    def _on_connect(self, client, userdata, flags, rc):
+    def _on_connect(self, client, userdata, flags, rc, properties=None):
         client.subscribe("shell/+/presence", qos=1)
 
     def _on_message(self, client, userdata, msg):

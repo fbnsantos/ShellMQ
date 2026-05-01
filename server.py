@@ -95,7 +95,7 @@ class MoleServer:
 
     # ── MQTT callbacks ────────────────────────────────────────────────────────
 
-    def _on_connect(self, client, userdata, flags, rc):
+    def _on_connect(self, client, userdata, flags, rc, properties=None):
         if rc != 0:
             log.error("Failed to connect to broker: rc=%d", rc)
             return
@@ -104,7 +104,7 @@ class MoleServer:
         log.info("Listening on shell/%s/control/new", self.device_id)
         self._publish_presence()
 
-    def _on_disconnect(self, client, userdata, rc):
+    def _on_disconnect(self, client, userdata, rc, properties=None):
         log.warning("Disconnected from broker (rc=%d), reconnecting...", rc)
 
     def _on_message(self, client, userdata, msg):
