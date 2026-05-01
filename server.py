@@ -152,6 +152,7 @@ class MoleServer:
 
             # open a PTY pair
             master_fd, slave_fd = pty.openpty()
+            log.debug("PTY opened: master=%d slave=%d", master_fd, slave_fd)
 
             # launch the shell attached to the PTY
             env = os.environ.copy()
@@ -168,40 +169,45 @@ class MoleServer:
                 preexec_fn=os.setsid,
             )
             os.close(slave_fd)
+            log.debug("Shell launched: PID %d", proc.pid)
 
             session.pid = proc.pid
             session.master_fd = master_fd
             self.sessions[session_id] = session
 
-            # subscribe to this session's topics
-            self.client.subscribe(session.topic_in(), qos=0)
-            self.client.subscribe(session.topic_resize(), qos=0)
+        # ── outside the lock: subscribe, publish, start thread ──
 
-            # announce session to the client
-            self.client.publish(
-                f"shell/{self.device_id}/control/announce/{session_id}",
-                json.dumps({
-                    "session_id": session_id,
-                    "device_id": self.device_id,
-                    "shell": self.shell,
-                    "created_at": session.created_at,
-                }),
-                qos=1,
-                retain=True,
-            )
+        # subscribe to this session's topics
+        self.client.subscribe(session.topic_in(), qos=0)
+        self.client.subscribe(session.topic_resize(), qos=0)
 
-            self._publish_presence()
+        # announce session to the client (retained so client always receives it)
+        log.debug("Publishing announce for session %s", session_id)
+        result = self.client.publish(
+            f"shell/{self.device_id}/control/announce/{session_id}",
+            json.dumps({
+                "session_id": session_id,
+                "device_id": self.device_id,
+                "shell": self.shell,
+                "created_at": session.created_at,
+            }),
+            qos=1,
+            retain=True,
+        )
+        log.debug("Announce publish rc=%s mid=%s", result.rc, result.mid)
 
-            # start background thread to read PTY output
-            t = threading.Thread(
-                target=self._read_pty_loop,
-                args=(session, proc),
-                daemon=True,
-                name=f"pty-read-{session_id}",
-            )
-            t.start()
+        self._publish_presence()
 
-            log.info("Session %s started (PID %d)", session_id, proc.pid)
+        # start background thread to read PTY output
+        t = threading.Thread(
+            target=self._read_pty_loop,
+            args=(session, proc),
+            daemon=True,
+            name=f"pty-read-{session_id}",
+        )
+        t.start()
+
+        log.info("Session %s started (PID %d)", session_id, proc.pid)
 
     def _write_to_pty(self, session: Session, data: bytes):
         if not session.alive:
