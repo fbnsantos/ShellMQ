@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+##!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
 # mole — installer
 # Installs the mole server as a systemd service that starts on boot.
@@ -111,7 +111,15 @@ if ! "$VENV_PYTHON" -m pip --version &>/dev/null; then
     info "pip not found in venv — bootstrapping with get-pip.py ..."
     TMP_PIP="$(mktemp /tmp/get-pip.XXXXXX.py)"
     if command -v curl &>/dev/null; then
-        curl -fsSL https://bootstrap.pypa.io/get-pip.py -o "$TMP_PIP"
+        PY_VER="$("$VENV_PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+        PIP_URL="https://bootstrap.pypa.io/get-pip.py"
+        if [[ "$PY_VER" == "3.8" ]]; then
+            PIP_URL="https://bootstrap.pypa.io/pip/3.8/get-pip.py"
+        elif [[ "$PY_VER" == "3.9" ]]; then
+            PIP_URL="https://bootstrap.pypa.io/pip/3.9/get-pip.py"
+        fi
+        curl -fsSL "$PIP_URL" -o "$TMP_PIP"
+       "$VENV_PYTHON" "$TMP_PIP" --quiet
     elif command -v wget &>/dev/null; then
         wget -qO "$TMP_PIP" https://bootstrap.pypa.io/get-pip.py
     else
