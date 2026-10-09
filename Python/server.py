@@ -7,7 +7,12 @@ Topics:
   shell/<device_id>/session/<session_id>/in   <- input from client
   shell/<device_id>/session/<session_id>/out  -> output to client
   shell/<device_id>/control/new               <- client requests a new session
-  shell/<device_id>/control/announce          -> server confirms session created
+  shell/<device_id>/control/close             <- client closes a session
+  shell/<device_id>/control/attach            <- client reattaches to an open session
+  shell/<device_id>/session/<sid>/replay/<n>  -> recent output, answer to an attach
+  shell/<device_id>/control/keepalive         <- attached clients, every 30 s
+  shell/<device_id>/control/announce/<sid>    -> server confirms session created (retained,
+                                                 cleared when the session closes)
   shell/<device_id>/presence                  -> device presence (retained)
 """
 
@@ -21,6 +26,7 @@ import signal
 import subprocess
 import sys
 import threading
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -42,6 +48,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("mole-server")
 
+# recent output kept per session, replayed to clients that reattach
+SCROLLBACK_BYTES = 64 * 1024
+# attach reply ids become part of a topic: no wildcards or separators
+_REPLY_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
 # ── session dataclass ─────────────────────────────────────────────────────────
 
 @dataclass
@@ -53,6 +64,14 @@ class Session:
     pid: int = 0
     master_fd: int = -1
     alive: bool = True
+    proc: Optional[subprocess.Popen] = None
+    reader: Optional[threading.Thread] = None
+    # last time a client typed, attached or sent a keepalive
+    last_seen: float = field(default_factory=time.time)
+    scrollback: bytearray = field(default_factory=bytearray)
+    # held while appending + publishing output, so a replay snapshot never
+    # misses or duplicates a chunk
+    out_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def topic_in(self):
         return f"shell/{self.device_id}/session/{self.session_id}/in"
@@ -63,14 +82,21 @@ class Session:
     def topic_resize(self):
         return f"shell/{self.device_id}/session/{self.session_id}/resize"
 
+    def topic_announce(self):
+        return f"shell/{self.device_id}/control/announce/{self.session_id}"
+
+    def topic_replay(self, reply_id: str):
+        return f"shell/{self.device_id}/session/{self.session_id}/replay/{reply_id}"
+
 
 # ── server ────────────────────────────────────────────────────────────────────
 
 class MoleServer:
     def __init__(self, device_id: str, broker: str, port: int,
                  username: Optional[str], password: Optional[str],
-                 tls: bool, shell: str):
+                 tls: bool, shell: str, session_timeout: int):
         self.device_id = device_id
+        self.session_timeout = session_timeout
         self.broker = broker
         self.port = port
         self.shell = shell
@@ -101,10 +127,27 @@ class MoleServer:
             return
         log.info("Connected to broker %s:%d", self.broker, self.port)
         client.subscribe(f"shell/{self.device_id}/control/new", qos=1)
+        client.subscribe(f"shell/{self.device_id}/control/close", qos=1)
+        client.subscribe(f"shell/{self.device_id}/control/attach", qos=1)
+        client.subscribe(f"shell/{self.device_id}/control/keepalive", qos=0)
         log.info("Listening on shell/%s/control/new", self.device_id)
+
+        # clean session: subscriptions are lost on reconnect, restore them
+        # for the sessions that are still open
+        with self._lock:
+            open_sessions = [s for s in self.sessions.values() if s.alive]
+        for session in open_sessions:
+            client.subscribe(session.topic_in(), qos=0)
+            client.subscribe(session.topic_resize(), qos=0)
+        if open_sessions:
+            log.info("Resubscribed %d open session(s)", len(open_sessions))
+
         self._publish_presence()
 
     def _on_disconnect(self, client, userdata, rc, properties=None):
+        if rc == 0:
+            log.info("Disconnected from broker")
+            return
         log.warning("Disconnected from broker (rc=%d), reconnecting...", rc)
 
     def _on_message(self, client, userdata, msg):
@@ -121,9 +164,59 @@ class MoleServer:
                 log.error("Error processing new session request: %s", e)
             return
 
+        # client asked to close a session
+        if topic == f"shell/{self.device_id}/control/close":
+            try:
+                session_id = json.loads(payload.decode()).get("session_id")
+            except Exception as e:
+                log.error("Error processing close request: %s", e)
+                return
+            with self._lock:
+                session = self.sessions.get(session_id)
+            if session:
+                log.info("Close requested for session %s", session_id)
+                self._close_session(session)
+            return
+
+        # client wants to reattach: send it the recent output
+        if topic == f"shell/{self.device_id}/control/attach":
+            try:
+                data = json.loads(payload.decode())
+                session_id = data.get("session_id")
+                reply_id = str(data.get("reply_id", ""))
+            except Exception as e:
+                log.error("Error processing attach request: %s", e)
+                return
+            if not _REPLY_ID_RE.match(reply_id):
+                log.warning("Attach request with invalid reply_id ignored")
+                return
+            with self._lock:
+                session = self.sessions.get(session_id)
+            if session and session.alive:
+                log.info("Client attached to session %s", session_id)
+                session.last_seen = time.time()
+                with session.out_lock:
+                    self.client.publish(session.topic_replay(reply_id),
+                                        bytes(session.scrollback), qos=1)
+            return
+
+        # attached clients say they are still there
+        if topic == f"shell/{self.device_id}/control/keepalive":
+            try:
+                ids = json.loads(payload.decode()).get("session_ids", [])
+            except Exception:
+                return
+            now = time.time()
+            with self._lock:
+                for sid in ids if isinstance(ids, list) else []:
+                    if sid in self.sessions:
+                        self.sessions[sid].last_seen = now
+            return
+
         # input or resize for an existing session
         for session in list(self.sessions.values()):
             if topic == session.topic_in():
+                session.last_seen = time.time()
                 self._write_to_pty(session, payload)
                 return
             if topic == session.topic_resize():
@@ -172,6 +265,7 @@ class MoleServer:
             log.debug("Shell launched: PID %d", proc.pid)
 
             session.pid = proc.pid
+            session.proc = proc
             session.master_fd = master_fd
             self.sessions[session_id] = session
 
@@ -184,7 +278,7 @@ class MoleServer:
         # announce session to the client (retained so client always receives it)
         log.debug("Publishing announce for session %s", session_id)
         result = self.client.publish(
-            f"shell/{self.device_id}/control/announce/{session_id}",
+            session.topic_announce(),
             json.dumps({
                 "session_id": session_id,
                 "device_id": self.device_id,
@@ -205,6 +299,7 @@ class MoleServer:
             daemon=True,
             name=f"pty-read-{session_id}",
         )
+        session.reader = t
         t.start()
 
         log.info("Session %s started (PID %d)", session_id, proc.pid)
@@ -233,7 +328,6 @@ class MoleServer:
     def _read_pty_loop(self, session: Session, proc: subprocess.Popen):
         """Reads output from the PTY master and publishes it over MQTT."""
         fd = session.master_fd
-        topic_out = session.topic_out()
 
         while session.alive:
             try:
@@ -245,7 +339,7 @@ class MoleServer:
                         break
                     if not data:
                         break
-                    self.client.publish(topic_out, data, qos=0)
+                    self._publish_output(session, data)
             except Exception as e:
                 log.error("PTY read loop error: %s", e)
                 break
@@ -258,28 +352,53 @@ class MoleServer:
                     if r:
                         data = os.read(fd, 4096)
                         if data:
-                            self.client.publish(topic_out, data, qos=0)
+                            self._publish_output(session, data)
                 except OSError:
                     pass
                 break
 
-        self._close_session(session)
+        self._finish_session(session)
+
+    def _publish_output(self, session: Session, data: bytes):
+        with session.out_lock:
+            session.scrollback += data
+            if len(session.scrollback) > SCROLLBACK_BYTES:
+                del session.scrollback[:len(session.scrollback) - SCROLLBACK_BYTES]
+            self.client.publish(session.topic_out(), data, qos=0)
+
+    def _reap_idle_sessions(self):
+        """Closes sessions no client has touched for session_timeout seconds
+        (tab closed, client crashed...), so shells do not pile up."""
+        while True:
+            time.sleep(30)
+            now = time.time()
+            with self._lock:
+                idle = [s for s in self.sessions.values()
+                        if s.alive and now - s.last_seen > self.session_timeout]
+            for session in idle:
+                log.info("Session %s idle for more than %d s without clients, closing",
+                         session.session_id, self.session_timeout)
+                self._close_session(session)
 
     def _close_session(self, session: Session):
-        if not session.alive:
-            return
-        session.alive = False
-        log.info("Session %s closed", session.session_id)
-
+        """Asks a session to close. Safe to call from any thread; the PTY
+        reader thread notices within 100 ms and does the actual cleanup."""
+        with self._lock:
+            if not session.alive:
+                return
+            session.alive = False
+        # interactive bash ignores SIGTERM, SIGHUP makes it exit
         try:
-            os.close(session.master_fd)
-        except OSError:
-            pass
-
-        try:
-            os.killpg(os.getpgid(session.pid), signal.SIGTERM)
+            os.killpg(session.pid, signal.SIGHUP)
         except (OSError, ProcessLookupError):
             pass
+
+    def _finish_session(self, session: Session):
+        """Releases everything a session holds. Runs only on its reader thread,
+        so the master fd is never closed while it is still being read."""
+        with self._lock:
+            session.alive = False
+        log.info("Session %s closed", session.session_id)
 
         self.client.unsubscribe(session.topic_in())
         self.client.unsubscribe(session.topic_resize())
@@ -289,6 +408,27 @@ class MoleServer:
             "\r\n[mole: session closed]\r\n".encode(),
             qos=1,
         )
+        # clear the retained announce so it does not stay in the broker forever
+        self.client.publish(session.topic_announce(), b"", qos=1, retain=True)
+
+        # closing the master also hangs up the shell
+        try:
+            os.close(session.master_fd)
+        except OSError:
+            pass
+        try:
+            os.killpg(session.pid, signal.SIGHUP)
+        except (OSError, ProcessLookupError):
+            pass
+        if session.proc is not None:
+            try:
+                session.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(session.pid, signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    pass
+                session.proc.wait()
 
         with self._lock:
             self.sessions.pop(session.session_id, None)
@@ -330,17 +470,41 @@ class MoleServer:
             retain=True,
         )
 
+        if self.session_timeout > 0:
+            threading.Thread(target=self._reap_idle_sessions, daemon=True,
+                             name="idle-reaper").start()
+
         log.info("Connecting to broker %s:%d ...", self.broker, self.port)
         self.client.connect(self.broker, self.port, keepalive=60)
+
+        # systemd stops the service with SIGTERM: shut down the same way as Ctrl+C
+        def _on_sigterm(signum, frame):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, _on_sigterm)
 
         try:
             self.client.loop_forever()
         except KeyboardInterrupt:
             log.info("Shutting down...")
+            # keep the network loop running so the close messages get out
+            self.client.loop_start()
             with self._lock:
-                for session in list(self.sessions.values()):
-                    self._close_session(session)
+                open_sessions = list(self.sessions.values())
+            for session in open_sessions:
+                self._close_session(session)
+            for session in open_sessions:
+                if session.reader is not None:
+                    session.reader.join(timeout=3)
+            # a clean disconnect does not trigger the Last Will, mark offline ourselves
+            info = self.client.publish(
+                f"shell/{self.device_id}/presence",
+                json.dumps({"device_id": self.device_id, "online": False}),
+                qos=1,
+                retain=True,
+            )
+            info.wait_for_publish(timeout=2)
             self.client.disconnect()
+            self.client.loop_stop()
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -355,14 +519,18 @@ def main():
                         help="MQTT broker address")
     parser.add_argument("--port", type=int, default=1883,
                         help="MQTT broker port")
-    parser.add_argument("--username", default=None,
-                        help="MQTT username")
-    parser.add_argument("--password", default=None,
-                        help="MQTT password")
+    parser.add_argument("--username", default=os.environ.get("MOLE_USERNAME") or None,
+                        help="MQTT username (default: $MOLE_USERNAME)")
+    parser.add_argument("--password", default=os.environ.get("MOLE_PASSWORD") or None,
+                        help="MQTT password (default: $MOLE_PASSWORD; prefer the "
+                             "variable, arguments are visible in ps)")
     parser.add_argument("--tls", action="store_true",
                         help="Enable TLS (default port changes to 8883)")
     parser.add_argument("--shell", default="/bin/bash",
                         help="Shell to expose")
+    parser.add_argument("--session-timeout", type=int, default=600,
+                        help="Close sessions with no attached client for this many "
+                             "seconds (default: 600, 0 = never)")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
     args = parser.parse_args()
@@ -383,6 +551,7 @@ def main():
         password=args.password,
         tls=args.tls,
         shell=args.shell,
+        session_timeout=args.session_timeout,
     )
     server.run()
 

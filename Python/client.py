@@ -237,6 +237,20 @@ class MoleClient:
         log.debug("stdin loop done")
         self._running = False
 
+    # ── keepalive ─────────────────────────────────────────────────────────────
+
+    def _keepalive_loop(self):
+        """Tells the server we are still attached, so it does not close the
+        session as idle while we are just watching output."""
+        topic = f"shell/{self.device_id}/control/keepalive"
+        payload = json.dumps({"session_ids": [self.session_id]})
+        while self._running:
+            self.client.publish(topic, payload, qos=0)
+            for _ in range(30):
+                if not self._running:
+                    return
+                time.sleep(1)
+
     # ── run ───────────────────────────────────────────────────────────────────
 
     def run(self):
@@ -294,6 +308,8 @@ class MoleClient:
         sys.stdout.flush()
 
         self._setup_sigwinch()
+        threading.Thread(target=self._keepalive_loop, daemon=True,
+                         name="keepalive").start()
         self._send_resize()
 
         with RawTerminal() as raw_term:
@@ -308,6 +324,14 @@ class MoleClient:
             self.client.publish(self._topic_in(), ps1_prompt.encode(), qos=0)
             self._stdin_loop(raw_term)
             # Note: terminal already restored inside _stdin_loop cleanup
+
+        # close the remote shell instead of leaving it orphaned on the device
+        info = self.client.publish(
+            f"shell/{self.device_id}/control/close",
+            json.dumps({"session_id": self.session_id}),
+            qos=1,
+        )
+        info.wait_for_publish(timeout=2)
 
         sys.stdout.write(
             f"\r\n\033[1;32m{banner}\033[0m\r\n"
