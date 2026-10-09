@@ -1,4 +1,4 @@
-##!/usr/bin/env bash
+#!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
 # mole — installer
 # Installs the mole server as a systemd service that starts on boot.
@@ -110,18 +110,17 @@ VENV_PYTHON="${VENV_DIR}/bin/python3"
 if ! "$VENV_PYTHON" -m pip --version &>/dev/null; then
     info "pip not found in venv — bootstrapping with get-pip.py ..."
     TMP_PIP="$(mktemp /tmp/get-pip.XXXXXX.py)"
+    PY_VER="$("$VENV_PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+    PIP_URL="https://bootstrap.pypa.io/get-pip.py"
+    if [[ "$PY_VER" == "3.8" ]]; then
+        PIP_URL="https://bootstrap.pypa.io/pip/3.8/get-pip.py"
+    elif [[ "$PY_VER" == "3.9" ]]; then
+        PIP_URL="https://bootstrap.pypa.io/pip/3.9/get-pip.py"
+    fi
     if command -v curl &>/dev/null; then
-        PY_VER="$("$VENV_PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-        PIP_URL="https://bootstrap.pypa.io/get-pip.py"
-        if [[ "$PY_VER" == "3.8" ]]; then
-            PIP_URL="https://bootstrap.pypa.io/pip/3.8/get-pip.py"
-        elif [[ "$PY_VER" == "3.9" ]]; then
-            PIP_URL="https://bootstrap.pypa.io/pip/3.9/get-pip.py"
-        fi
         curl -fsSL "$PIP_URL" -o "$TMP_PIP"
-       "$VENV_PYTHON" "$TMP_PIP" --quiet
     elif command -v wget &>/dev/null; then
-        wget -qO "$TMP_PIP" https://bootstrap.pypa.io/get-pip.py
+        wget -qO "$TMP_PIP" "$PIP_URL"
     else
         error "Neither curl nor wget found — cannot bootstrap pip"
     fi
@@ -150,8 +149,10 @@ chmod 600 "$ENV_FILE"
 chown "$RUN_AS:$RUN_AS" "$ENV_FILE"
 success "Environment file written to ${ENV_FILE}"
 
-# ── build ExecStart — credentials come from EnvironmentFile ──────────────────
-# systemd expands ${VAR} from EnvironmentFile before launching the process
+# ── build ExecStart ───────────────────────────────────────────────────────────
+# systemd expands ${VAR} from EnvironmentFile before launching the process.
+# Credentials are NOT passed as arguments (they would show up in `ps`):
+# server.py reads MOLE_USERNAME / MOLE_PASSWORD straight from the environment.
 TLS_ARG=""
 [[ -n "$TLS" ]] && TLS_ARG="--tls"
 EXEC_CMD="${VENV_PYTHON} ${INSTALL_DIR}/server.py"
@@ -159,19 +160,17 @@ EXEC_CMD+=" --broker \${MOLE_BROKER}"
 EXEC_CMD+=" --port \${MOLE_PORT}"
 EXEC_CMD+=" --device-id \${MOLE_DEVICE_ID}"
 EXEC_CMD+=" --shell \${MOLE_SHELL}"
-EXEC_CMD+=" --username \${MOLE_USERNAME}"
-EXEC_CMD+=" --password \${MOLE_PASSWORD}"
 [[ -n "$TLS" ]] && EXEC_CMD+=" --tls"
 
 # ── write config file ─────────────────────────────────────────────────────────
 CONFIG_FILE="${INSTALL_DIR}/mole.conf"
 cat > "$CONFIG_FILE" << EOF
-# mole configuration — edit and run install.sh again to apply changes
+# mole configuration (for reference — the service reads mole.env;
+# credentials are kept only there)
 BROKER=${BROKER}
 PORT=${PORT}
 DEVICE_ID=${DEVICE_ID}
 USERNAME=${USERNAME}
-PASSWORD='${PASSWORD}'
 SHELL=${SHELL_BIN}
 TLS=${TLS}
 EOF

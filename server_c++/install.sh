@@ -51,6 +51,32 @@ if [[ $UNINSTALL -eq 1 ]]; then
     exit 0
 fi
 
+# ── paho-mqtt from source (when the distro has no packages) ──────────────────
+PAHO_C_VERSION="v1.3.13"
+PAHO_CPP_VERSION="v1.3.2"
+
+build_paho() {
+    command -v git &>/dev/null || apt-get install -y git
+    local src="${BUILD_DIR}/paho-src"
+    rm -rf "$src" && mkdir -p "$src"
+    git clone --depth 1 --branch "$PAHO_C_VERSION" \
+        https://github.com/eclipse/paho.mqtt.c.git "$src/paho.mqtt.c"
+    git clone --depth 1 --branch "$PAHO_CPP_VERSION" \
+        https://github.com/eclipse/paho.mqtt.cpp.git "$src/paho.mqtt.cpp"
+
+    cmake -S "$src/paho.mqtt.c" -B "$src/build-c" \
+        -DPAHO_WITH_SSL=ON -DPAHO_ENABLE_TESTING=OFF -DPAHO_BUILD_STATIC=OFF
+    cmake --build "$src/build-c" --parallel "$(nproc)"
+    cmake --install "$src/build-c"
+
+    cmake -S "$src/paho.mqtt.cpp" -B "$src/build-cpp" -DPAHO_WITH_SSL=ON
+    cmake --build "$src/build-cpp" --parallel "$(nproc)"
+    cmake --install "$src/build-cpp"
+
+    ldconfig
+    success "paho-mqtt built and installed to /usr/local"
+}
+
 # ── install build dependencies ────────────────────────────────────────────────
 info "Installing build dependencies..."
 apt-get install -y --no-install-recommends \
@@ -60,6 +86,7 @@ apt-get install -y --no-install-recommends \
     nlohmann-json3-dev 2>/dev/null || {
     warn "Some packages may not be available — trying minimal set..."
     apt-get install -y build-essential cmake libssl-dev uuid-dev
+    apt-get install -y nlohmann-json3-dev || warn "nlohmann-json3-dev not available"
     # paho-mqtt: build from source if package not available
     if ! dpkg -l libpaho-mqttpp-dev &>/dev/null; then
         info "Building paho-mqtt from source..."
@@ -104,7 +131,8 @@ EXEC="${INSTALL_DIR}/bin/mole-server"
 EXEC+=" --broker \${MOLE_BROKER} --port \${MOLE_PORT}"
 EXEC+=" --device-id \${MOLE_DEVICE_ID}"
 EXEC+=" --shell \${MOLE_SHELL}"
-EXEC+=" --username \${MOLE_USERNAME} --password \${MOLE_PASSWORD}"
+# credentials are not passed as arguments (visible in `ps`): mole-server reads
+# MOLE_USERNAME / MOLE_PASSWORD from the environment set by EnvironmentFile
 [[ -n "$TLS" ]] && EXEC+=" --tls"
 
 # ── systemd unit ──────────────────────────────────────────────────────────────

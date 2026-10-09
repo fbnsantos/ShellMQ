@@ -167,7 +167,7 @@ cmake --build build-arm --parallel $(nproc)
 |-----------------|---------------|---------------------------------|
 | `--broker`      | `localhost`   | MQTT broker address             |
 | `--port`        | `1883`        | MQTT broker port                |
-| `--device-id`   | hostname      | Unique device identifier        |
+| `--device-id`   | hostname      | Device identifier — **must be unique** (see below) |
 | `--username`    | *(none)*      | MQTT username                   |
 | `--password`    | *(none)*      | MQTT password                   |
 | `--shell`       | `/bin/bash`   | Shell to expose                 |
@@ -189,8 +189,16 @@ sudo systemctl disable mole       # disable autostart
 sudo bash install.sh --uninstall  # remove completely
 ```
 
-Credentials are stored in `/opt/mole/mole.env` (permissions 600).
+Credentials are stored in `/opt/mole/mole.env` (permissions 600) and reach the
+server through the environment (`MOLE_USERNAME` / `MOLE_PASSWORD`), never as
+command-line arguments, so they do not show up in `ps`.
 Re-run `install.sh` with new options to update configuration.
+
+> **The device ID must be unique.** Two servers with the same `--device-id`
+> (for example two Raspberry Pis both called `raspberrypi`, or the service plus
+> a copy started by hand) share the same MQTT client ID and the broker keeps
+> kicking one out whenever the other connects. Sessions then stop responding
+> right after opening.
 
 ---
 
@@ -212,6 +220,9 @@ listener 9001
 protocol websockets
 allow_anonymous true
 ```
+
+> `allow_anonymous true` is for local testing only: anyone who can reach the
+> broker gets a shell on every device. See [Security](#security).
 
 ```bash
 sudo systemctl restart mosquitto
@@ -243,8 +254,19 @@ python3 web_client.py --port 8080
 # open http://localhost:8080
 ```
 
-Enter the broker address (WebSocket port, usually 9001), click **Connect**,
-select a device, click **New Session**.
+Enter the broker address (WebSocket port, usually 9001; tick **WSS** for a TLS
+listener), click **Connect**, select a device, click **New Session**.
+
+- Each device keeps its own session: you can switch to another device and come
+  back to the same shell, including the output produced while you were away.
+- Selecting a device without a session in this tab lists the sessions open on
+  it — click **Attach** to reattach (after a reload, from another tab, after
+  Disconnect...). The last 64 KB of output are replayed.
+- **New Session** starts another shell; the previous one keeps running and can
+  be reattached. **Sessions** leaves the current shell running and shows the list.
+- **Close Session** kills the shell on the device. Disconnecting or closing the
+  tab does *not* — see the session timeout below.
+- The log panel shows connection losses, reconnection attempts and broker errors.
 
 ---
 
@@ -253,7 +275,11 @@ select a device, click **New Session**.
 | Topic | Direction | Description |
 |-------|-----------|-------------|
 | `shell/<device>/control/new` | client→server | Request a new session |
-| `shell/<device>/control/announce/<session>` | server→client | Session confirmed (retained) |
+| `shell/<device>/control/close` | client→server | Close a session (`{"session_id": ...}`) |
+| `shell/<device>/control/attach` | client→server | Reattach (`{"session_id": ..., "reply_id": ...}`) |
+| `shell/<device>/session/<id>/replay/<reply_id>` | server→client | Recent output (last 64 KB), answer to an attach |
+| `shell/<device>/control/keepalive` | client→server | `{"session_ids": [...]}` every 30 s from attached clients |
+| `shell/<device>/control/announce/<session>` | server→client | Session confirmed (retained; cleared with an empty message when the session closes) |
 | `shell/<device>/presence` | server→all | Device presence (retained) |
 | `shell/<device>/session/<id>/in` | client→server | User input |
 | `shell/<device>/session/<id>/out` | server→client | Shell output |
@@ -264,13 +290,35 @@ select a device, click **New Session**.
 Each session has a random ID. Multiple clients can connect to the same device simultaneously.
 Both the Python and C++ servers support multiple concurrent sessions.
 
+Sessions survive broker reconnections: the server resubscribes the topics of
+every open session when it reconnects. A session ends when its shell exits,
+when a client sends `control/close`, when the server stops, or when no client
+has typed in it, attached to it or sent a keepalive for `--session-timeout`
+seconds (default 600 = 10 minutes; `0` keeps sessions forever). The web and CLI clients send
+keepalives automatically while attached, so only abandoned sessions are closed.
+
+---
+
+## Troubleshooting
+
+| Where | Command |
+|-------|---------|
+| Server status on the device | `systemctl status mole` |
+| Server logs on the device | `journalctl -u mole -f` |
+| Duplicate servers on the device | `ps aux \| grep -E "server.py\|mole-server" \| grep -v grep` (should show one line) |
+| Broker logs (apt install) | `sudo tail -f /var/log/mosquitto/mosquitto.log` or `sudo journalctl -u mosquitto -f` |
+| Broker logs (Docker) | `docker logs -f <container>` |
+| Browser | F12 → **Console** for errors, **Network → WS** for the WebSocket close code |
+
+Add `log_type all` to `mosquitto.conf` for more detail on why the broker drops a client.
+
 ---
 
 ## Security
 
 In production always use:
 
-1. **TLS on the broker** (port 8883 for MQTT, 9883 for WSS)
+1. **TLS on the broker** (port 8883 for MQTT, 9883 for WSS — tick **WSS** in the web client)
 2. **Authentication** via username/password or client certificates
 3. **ACLs on the broker** to restrict who can subscribe to `shell/#`
 
@@ -296,6 +344,6 @@ Free public broker for testing: `broker.hivemq.com:1883` / WS port: `8000`
 
 ## Interactive programs (vim, htop, tmux, etc.)
 
-Both servers use a real PTY (`forkpty()` in C++, `pty.openpty()` in Python).
+Both servers use a real PTY (`posix_openpt()` in C++, `pty.openpty()` in Python).
 Terminal resize (SIGWINCH) is forwarded automatically.
 Programs like `vim`, `htop`, `mc`, and `tmux` work correctly.
